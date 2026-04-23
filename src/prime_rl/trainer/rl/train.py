@@ -322,6 +322,15 @@ def train(config: TrainerConfig):
         loss_scale = sum(micro_batch["loss_mask"].sum().item() for micro_batch in micro_batches)
         loss_scale = max(loss_scale, 1)
 
+        # --- loss_scale diagnostic: gather across dp_cp ranks ---
+        local = torch.tensor([loss_scale], dtype=torch.float64, device="cuda")
+        dp_cp_group = parallel_dims.world_mesh["dp_cp"].get_group()
+        dp_cp_world_size = dist.get_world_size(dp_cp_group)
+        gathered = [torch.zeros_like(local) for _ in range(dp_cp_world_size)]
+        dist.all_gather(gathered, local, group=dp_cp_group)
+        scales = torch.stack(gathered).squeeze()  # shape: [dp_cp_world_size]
+        # --- end diagnostic gather ---
+
         logger.debug(f"Starting forward and backward pass ({batch_size=})")
         tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
         cp_enabled = parallel_dims.cp_enabled
@@ -568,6 +577,20 @@ def train(config: TrainerConfig):
             "step": progress.step,
         }
         monitor.log(time_metrics, step=progress.step)
+
+        # --- loss_scale diagnostic metrics ---
+        loss_scale_metrics = {
+            "loss_scale/local": loss_scale,
+            "loss_scale/mean": scales.mean().item(),
+            "loss_scale/std": scales.std().item(),
+            "loss_scale/min": scales.min().item(),
+            "loss_scale/max": scales.max().item(),
+            "loss_scale/cov": (scales.std() / scales.mean()).item(),
+            "loss_scale/max_ratio": (scales.max() / scales.min()).item(),
+            "step": progress.step,
+        }
+        monitor.log(loss_scale_metrics, step=progress.step)
+        # --- end diagnostic metrics ---
 
         # Log disk metrics
         disk_metrics = get_ckpt_disk_metrics(config.output_dir)
