@@ -2,8 +2,8 @@ max_steps = 250
 seq_len = 8192
 
 [wandb]
-project = "hendrycks-sanity"
-name = "hendrycks-sanity"
+project = "prime-rl-potential-loss-scale-bias"
+name = "loss-scale-diagnostic"
 
 [deployment]
 num_train_gpus = 2
