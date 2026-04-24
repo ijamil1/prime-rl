@@ -25,5 +25,10 @@ name = "hendrycks-math"
 name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 seq_len = 16384
 
+[trainer.model.lora]
+rank = 32
+alpha = 64
+
+
 [inference.model]
 max_model_len = 8192
