@@ -34,6 +34,7 @@ from prime_rl.trainer.rl.loss import (
     shift_tensor_left,
     shift_tensor_right,
 )
+from prime_rl.trainer.rl.diagnostics import GradientDiagnosticSession
 from prime_rl.trainer.model import (
     forward,
     setup_tokenizer,
@@ -147,6 +148,13 @@ def train(config: TrainerConfig):
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
 
+    gradient_diagnostic = GradientDiagnosticSession(
+        config.experimental.gradient_diagnostic,
+        model,
+        parallel_dims,
+        world,
+    )
+
     # Set up the loss function
     logger.info(f"Setting up loss function ({config.loss})")
     loss_fn = setup_loss_fn(config.loss)
@@ -175,8 +183,11 @@ def train(config: TrainerConfig):
 
     logger.info(f"Using `{config.scheduler.type}` scheduler ({config.scheduler})")
 
-    # Set up weight broadcast (skip when using fake data since there's no inference server)
-    if config.data.fake:
+    # Set up weight broadcast (skip when using fake/replay data since there's no inference server)
+    if gradient_diagnostic.replay_enabled:
+        weight_broadcast = None
+        logger.info("Skipping weight broadcast setup (gradient diagnostic replay mode)")
+    elif config.data.fake:
         weight_broadcast = None
         logger.info("Skipping weight broadcast setup (fake data mode)")
     else:
@@ -206,7 +217,9 @@ def train(config: TrainerConfig):
 
     # Set up the data loader (Optionally, use a fake data loader for debugging)
     logger.info(f"Initializing data loader ({config.data})")
-    if config.data.fake:
+    if gradient_diagnostic.replay_enabled:
+        dataloader = gradient_diagnostic.build_replay_dataloader(progress.step)
+    elif config.data.fake:
         dataloader = FakeDataLoader(config.data.fake, config.model.seq_len, parallel_dims.get_mesh("dp").size())
     else:
         dataloader = DataLoader(
@@ -309,6 +322,8 @@ def train(config: TrainerConfig):
         micro_batches = dataloader.get_batch()
         load_data_time = time.perf_counter() - load_data_start_time
         logger.debug(f"Loaded batch in {load_data_time:.2f} seconds")
+        gradient_diagnostic.after_batch_loaded(progress.step, micro_batches, dataloader)
+        gradient_diagnostic.align_pre_step_state(progress.step)
 
         batch_size = len(micro_batches)
         memory_profiler = None
@@ -321,6 +336,7 @@ def train(config: TrainerConfig):
         # Normalize by the local number of unmasked tokens in the batch (per-batch length normalization)
         loss_scale = sum(micro_batch["loss_mask"].sum().item() for micro_batch in micro_batches)
         loss_scale = max(loss_scale, 1)
+        gradient_diagnostic.collect_loss_metadata(loss_scale)
 
         # Gather loss_scale across DP ranks
         local = torch.tensor([loss_scale], dtype=torch.float64, device="cuda")
@@ -498,6 +514,7 @@ def train(config: TrainerConfig):
         for param in model.parameters():
             if param.grad is not None:
                 param.grad.mul_(dp_world_size)
+        gradient_diagnostic.save_gradients(progress.step, global_token_count=global_token_count)
 
         # All-reduce over the per-rank loss sums over DP ranks to get the mean per-token loss for logging.
         dist.all_reduce(step_local_loss_sum, op=dist.ReduceOp.SUM, group=dp_group)
@@ -515,11 +532,13 @@ def train(config: TrainerConfig):
         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
         # Update the model parameters
-        optimizer.step()
+        if not gradient_diagnostic.skip_optimizer_step:
+            optimizer.step()
         optimizer.zero_grad()
 
         # Update learning rate scheduler
-        scheduler.step()
+        if not gradient_diagnostic.skip_optimizer_step:
+            scheduler.step()
 
         if config.max_concurrent_runs == 1:
             current_lr = optimizer.param_groups[0]["lr"]

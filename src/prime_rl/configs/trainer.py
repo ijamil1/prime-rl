@@ -727,8 +727,52 @@ WeightBroadcastConfig: TypeAlias = Annotated[
 ]
 
 
+class GradientDiagnosticConfig(BaseConfig):
+    """Configures RL gradient record/replay diagnostics."""
+
+    mode: Annotated[
+        Literal["off", "record", "replay"],
+        Field(description="Whether to disable diagnostics, record live RL artifacts, or replay recorded artifacts."),
+    ] = "off"
+
+    artifact_dir: Annotated[
+        Path | None,
+        Field(description="Directory where gradient diagnostic artifacts are written."),
+    ] = None
+
+    source_dir: Annotated[
+        Path | None,
+        Field(description="Directory containing recorded gradient diagnostic artifacts for replay mode."),
+    ] = None
+
+    partition: Annotated[
+        Literal["round_robin"],
+        Field(description="How replay mode partitions recorded microbatches across DP ranks."),
+    ] = "round_robin"
+
+    save_pre_step_trainable_state: Annotated[
+        bool,
+        Field(description="Whether record mode saves trainable parameter state before each step."),
+    ] = True
+
+    load_pre_step_trainable_state: Annotated[
+        bool,
+        Field(description="Whether replay mode loads recorded trainable parameter state before each step."),
+    ] = True
+
+    skip_optimizer_step: Annotated[
+        bool,
+        Field(description="Whether replay mode skips optimizer and scheduler updates after capturing gradients."),
+    ] = True
+
+
 class TrainerExperimentalConfig(BaseConfig):
     """Experimental features for the trainer."""
+
+    gradient_diagnostic: Annotated[
+        GradientDiagnosticConfig,
+        Field(description="Experimental RL gradient record/replay diagnostics."),
+    ] = GradientDiagnosticConfig()
 
 
 class TrainerConfig(BaseConfig):
