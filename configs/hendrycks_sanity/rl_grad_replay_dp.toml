@@ -4,7 +4,7 @@ output_dir = "outputs/grad_diag_replay_dp"
 
 [wandb]
 project = "prime-rl-potential-loss-scale-bias"
-name = "replay-dp"
+name = "replay-dp-main"
 
 [deployment]
 num_train_gpus = 2
