@@ -172,6 +172,21 @@ In TOML, an empty section header does the same:
 [ckpt]  # enables checkpointing with defaults
 ```
 
+### RL gradient diagnostics
+
+RL trainer gradient record/replay is configured under `[trainer.experimental.gradient_diagnostic]`.
+
+```toml
+[trainer.experimental.gradient_diagnostic]
+mode = "record"  # "off", "record", or "replay"
+artifact_dir = "outputs/grad_diag_reference"
+source_dir = "outputs/grad_diag_reference"  # replay only
+partition = "round_robin"
+skip_optimizer_step = true
+```
+
+Replay mode is trainer-only when launched via `uv run rl`: it skips inference and orchestrator startup.
+
 ## Key files
 
 - `src/prime_rl/utils/config.py` — re-exports `BaseConfig` and `cli` from pydantic_config
