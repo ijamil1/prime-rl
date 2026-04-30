@@ -1,6 +1,6 @@
 max_steps = 20
 seq_len = 8192
-output_dir = "outputs/grad_diag_replay_dp"
+output_dir = "/workspace/grad_diag_runs/replay_dp"
 
 [wandb]
 project = "prime-rl-potential-loss-scale-bias"
@@ -35,8 +35,8 @@ freq = 2
 
 [trainer.experimental.gradient_diagnostic]
 mode = "replay"
-artifact_dir = "outputs/grad_diag_replay_dp_artifacts"
-source_dir = "outputs/grad_diag_reference"
+artifact_dir = "/workspace/grad_diag_artifacts/replay_dp"
+source_dir = "/workspace/grad_diag_artifacts/reference"
 partition = "round_robin"
 skip_optimizer_step = true
 

@@ -1,6 +1,6 @@
 max_steps = 20
 seq_len = 8192
-output_dir = "outputs/grad_diag_groundtruth"
+output_dir = "/workspace/grad_diag_runs/groundtruth"
 
 [wandb]
 project = "prime-rl-potential-loss-scale-bias"
@@ -36,7 +36,7 @@ freq = 2
 
 [trainer.experimental.gradient_diagnostic]
 mode = "record"
-artifact_dir = "outputs/grad_diag_reference"
+artifact_dir = "/workspace/grad_diag_artifacts/reference"
 
 [inference.model]
 max_model_len = 8192
