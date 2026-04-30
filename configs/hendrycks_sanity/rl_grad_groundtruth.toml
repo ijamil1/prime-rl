@@ -3,7 +3,7 @@ seq_len = 8192
 output_dir = "outputs/grad_diag_groundtruth"
 
 [wandb]
-project = "prime-rl-gradient-diagnostic"
+project = "prime-rl-potential-loss-scale-bias"
 name = "groundtruth-main"
 
 [deployment]
