@@ -113,14 +113,18 @@ def rl_local(config: RLConfig):
         logger.success("Dry run complete. To start an RL run locally, remove --dry-run from your command.")
         return
 
+    trainer_replay_only = config.trainer.experimental.gradient_diagnostic.mode == "replay"
+
     # Derive launcher-local GPU IDs from deployment config
     gpu_offset = 0
-    num_infer_gpus = config.deployment.num_infer_gpus if config.inference is not None else 0
+    num_infer_gpus = (
+        0 if trainer_replay_only else config.deployment.num_infer_gpus if config.inference is not None else 0
+    )
     infer_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_infer_gpus))
     gpu_offset += num_infer_gpus
     trainer_local_gpu_ids = list(range(gpu_offset, gpu_offset + config.deployment.num_train_gpus))
     gpu_offset += config.deployment.num_train_gpus
-    num_teacher_gpus = config.deployment.num_teacher_gpus or 0
+    num_teacher_gpus = 0 if trainer_replay_only else config.deployment.num_teacher_gpus or 0
     teacher_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_teacher_gpus)) if num_teacher_gpus > 0 else []
 
     total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus + num_teacher_gpus
@@ -152,7 +156,7 @@ def rl_local(config: RLConfig):
     check_gpus_available(all_gpu_ids)
 
     # Validate client port matches inference server port
-    if config.inference is not None and not config.orchestrator.client.is_elastic:
+    if not trainer_replay_only and config.inference is not None and not config.orchestrator.client.is_elastic:
         from urllib.parse import urlparse
 
         base_url = config.orchestrator.client.base_url[0]
@@ -186,7 +190,7 @@ def rl_local(config: RLConfig):
 
     try:
         # Optionally, start inference process
-        if config.inference:
+        if config.inference and not trainer_replay_only:
             inference_cmd = ["inference", "@", (config_dir / INFERENCE_TOML).as_posix()]
             logger.info(f"Starting inference on GPU(s) {' '.join(map(str, infer_gpu_ids))}")
             logger.debug(f"Inference start command: {' '.join(inference_cmd)}")
@@ -213,7 +217,7 @@ def rl_local(config: RLConfig):
             )
             monitor_thread.start()
             monitor_threads.append(monitor_thread)
-        else:
+        elif not trainer_replay_only:
             if config.orchestrator.teacher_rollout_model is None:
                 logger.warning(
                     "No inference config specified, skipping starting inference server. Make sure your inference server is running."
@@ -224,7 +228,7 @@ def rl_local(config: RLConfig):
                 )
 
         # Optionally, start teacher inference process
-        if config.teacher_inference:
+        if config.teacher_inference and not trainer_replay_only:
             if not teacher_gpu_ids:
                 raise ValueError(
                     "teacher_inference is configured but deployment.num_teacher_gpus is not set. "
@@ -257,48 +261,51 @@ def rl_local(config: RLConfig):
             )
             monitor_thread.start()
             monitor_threads.append(monitor_thread)
-        elif (
-            config.trainer.loss.type == "default" and config.trainer.loss.teacher_tau > 0
-        ) or config.orchestrator.teacher_model:
+        elif not trainer_replay_only and (
+            (config.trainer.loss.type == "default" and config.trainer.loss.teacher_tau > 0)
+            or config.orchestrator.teacher_model
+        ):
             logger.warning(
                 "No teacher_inference config specified, skipping starting teacher inference server. "
                 "Is your teacher inference server running? Make sure orchestrator.teacher_model is configured."
             )
 
         # Start orchestrator process
-        orchestrator_cmd = [
-            "orchestrator",
-            "@",
-            (config_dir / ORCHESTRATOR_TOML).as_posix(),
-        ]
-        logger.info("Starting orchestrator process")
-        logger.debug(f"Orchestrator start command: {' '.join(orchestrator_cmd)}")
-        with open(log_dir / "orchestrator.log", "w") as log_file:
-            orchestrator_process = Popen(
-                orchestrator_cmd,
-                stdout=log_file,
-                stderr=log_file,
-                env={
-                    **os.environ,
-                    **wandb_shared_env,
-                    "WANDB_SHARED_LABEL": "orchestrator",
-                    "LOGURU_FORCE_COLORS": "1",
-                    "WANDB_PROGRAM": "uv run rl",
-                    "WANDB_ARGS": json.dumps(start_command),
-                },
-            )
-        processes.append(orchestrator_process)
+        orchestrator_process = None
+        if not trainer_replay_only:
+            orchestrator_cmd = [
+                "orchestrator",
+                "@",
+                (config_dir / ORCHESTRATOR_TOML).as_posix(),
+            ]
+            logger.info("Starting orchestrator process")
+            logger.debug(f"Orchestrator start command: {' '.join(orchestrator_cmd)}")
+            with open(log_dir / "orchestrator.log", "w") as log_file:
+                orchestrator_process = Popen(
+                    orchestrator_cmd,
+                    stdout=log_file,
+                    stderr=log_file,
+                    env={
+                        **os.environ,
+                        **wandb_shared_env,
+                        "WANDB_SHARED_LABEL": "orchestrator",
+                        "LOGURU_FORCE_COLORS": "1",
+                        "WANDB_PROGRAM": "uv run rl",
+                        "WANDB_ARGS": json.dumps(start_command),
+                    },
+                )
+            processes.append(orchestrator_process)
 
-        # Start monitoring thread
-        stop_event = Event()
-        stop_events["orchestrator"] = stop_event
-        monitor_thread = Thread(
-            target=monitor_process,
-            args=(orchestrator_process, stop_event, error_queue, "orchestrator"),
-            daemon=True,
-        )
-        monitor_thread.start()
-        monitor_threads.append(monitor_thread)
+            # Start monitoring thread
+            stop_event = Event()
+            stop_events["orchestrator"] = stop_event
+            monitor_thread = Thread(
+                target=monitor_process,
+                args=(orchestrator_process, stop_event, error_queue, "orchestrator"),
+                daemon=True,
+            )
+            monitor_thread.start()
+            monitor_threads.append(monitor_thread)
 
         # Start training process
         trainer_cmd = [
@@ -357,7 +364,8 @@ def rl_local(config: RLConfig):
         processes.append(tail_process)
 
         # Check for errors from monitor threads
-        while not (stop_events["orchestrator"].is_set() and stop_events["trainer"].is_set()):
+        required_processes = ["trainer"] if trainer_replay_only else ["orchestrator", "trainer"]
+        while not all(stop_events[name].is_set() for name in required_processes):
             if error_queue:
                 error = error_queue[0]
                 logger.error(f"Error: {error}")
@@ -370,7 +378,7 @@ def rl_local(config: RLConfig):
             time.sleep(1)
 
         # Check if any critical process failed
-        if orchestrator_process.returncode != 0:
+        if orchestrator_process is not None and orchestrator_process.returncode != 0:
             logger.error(f"Orchestrator failed with exit code {orchestrator_process.returncode}")
             cleanup_threads(monitor_threads)
             cleanup_processes(processes)
