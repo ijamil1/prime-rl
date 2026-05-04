@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import io
 import json
@@ -15,6 +16,7 @@ from prime_rl.configs.trainer import GradientDiagnosticConfig
 from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.rl.data import TensorMicroBatch
 from prime_rl.trainer.world import World
+from prime_rl.utils.logger import get_logger
 
 
 def _step_dir(root: Path, step: int) -> Path:
@@ -91,6 +93,26 @@ def _maybe_get_git_ref() -> str | None:
     return result.stdout.strip() or None
 
 
+def _make_dummy_tensor_micro_batch(source: TensorMicroBatch) -> TensorMicroBatch:
+    dummy = copy.deepcopy(source)
+    dummy["advantages"] = torch.zeros_like(source["advantages"])
+    dummy["loss_mask"] = torch.zeros_like(source["loss_mask"], dtype=torch.bool)
+    return dummy
+
+
+def _pad_replay_micro_batches_for_distribution(
+    micro_batches: list[TensorMicroBatch], dp_world_size: int
+) -> list[TensorMicroBatch]:
+    num_padding = -len(micro_batches) % dp_world_size
+    if num_padding == 0 or not micro_batches:
+        return micro_batches
+
+    padded_micro_batches = list(micro_batches)
+    dummy = _make_dummy_tensor_micro_batch(micro_batches[0])
+    padded_micro_batches.extend([dummy] * num_padding)
+    return padded_micro_batches
+
+
 class GradientReplayDataLoader:
     def __init__(self, config: GradientDiagnosticConfig, dp_world_size: int, world: World, start_step: int):
         if config.source_dir is None:
@@ -105,6 +127,9 @@ class GradientReplayDataLoader:
         self.current_step = start_step
         self.last_batch_hash: str | None = None
         self.last_local_batch_hash: str | None = None
+        self.last_execution_batch_hash: str | None = None
+        self.last_execution_local_batch_hash: str | None = None
+        self.last_replay_padding_micro_batches = 0
 
     def wait_for_batch(self) -> None:
         path = _step_dir(self.config.source_dir, self.current_step) / "micro_batches.pt"
@@ -113,14 +138,28 @@ class GradientReplayDataLoader:
 
     def get_batch(self) -> list[TensorMicroBatch]:
         micro_batches = load_micro_batches(self.config.source_dir, self.current_step)
-        local_micro_batches = micro_batches[self.dp_rank :: self.dp_world_size]
+        original_count = len(micro_batches)
+        original_local_micro_batches = micro_batches[self.dp_rank :: self.dp_world_size]
+        self.last_batch_hash = _hash_value(micro_batches)
+        self.last_local_batch_hash = _hash_value(original_local_micro_batches)
+
+        padded_micro_batches = _pad_replay_micro_batches_for_distribution(micro_batches, self.dp_world_size)
+        self.last_replay_padding_micro_batches = len(padded_micro_batches) - original_count
+        self.last_execution_batch_hash = _hash_value(padded_micro_batches)
+        local_micro_batches = padded_micro_batches[self.dp_rank :: self.dp_world_size]
+        self.last_execution_local_batch_hash = _hash_value(local_micro_batches)
         if not local_micro_batches:
             raise ValueError(
                 f"No replay microbatches assigned to DP rank {self.dp_rank}; "
                 f"recorded={len(micro_batches)}, dp_world_size={self.dp_world_size}"
             )
-        self.last_batch_hash = _hash_value(micro_batches)
-        self.last_local_batch_hash = _hash_value(local_micro_batches)
+        if self.last_replay_padding_micro_batches:
+            get_logger().debug(
+                "Padded gradient replay microbatches for DP distribution: "
+                f"step={self.current_step}, recorded={original_count}, "
+                f"padding={self.last_replay_padding_micro_batches}, "
+                f"padded={len(padded_micro_batches)}, dp_world_size={self.dp_world_size}, dp_rank={self.dp_rank}"
+            )
         self.current_step += 1
         return local_micro_batches
 
@@ -230,6 +269,9 @@ class GradientDiagnosticSession:
         self.world = world
         self.batch_hash: str | None = None
         self.local_batch_hash: str | None = None
+        self.execution_batch_hash: str | None = None
+        self.execution_local_batch_hash: str | None = None
+        self.replay_padding_micro_batches = 0
         self.pre_step_state_hash: str | None = None
         self.loss_metadata: dict[str, Any] = {}
         self.git_ref = _maybe_get_git_ref()
@@ -273,6 +315,9 @@ class GradientDiagnosticSession:
         elif self.replay_enabled:
             self.batch_hash = getattr(dataloader, "last_batch_hash", None)
             self.local_batch_hash = getattr(dataloader, "last_local_batch_hash", None)
+            self.execution_batch_hash = getattr(dataloader, "last_execution_batch_hash", None)
+            self.execution_local_batch_hash = getattr(dataloader, "last_execution_local_batch_hash", None)
+            self.replay_padding_micro_batches = getattr(dataloader, "last_replay_padding_micro_batches", 0)
 
     def align_pre_step_state(self, step: int) -> None:
         if not self.enabled:
@@ -312,6 +357,9 @@ class GradientDiagnosticSession:
             "global_token_count": global_token_count,
             "batch_hash": self.batch_hash,
             "local_batch_hash": self.local_batch_hash,
+            "execution_batch_hash": self.execution_batch_hash,
+            "execution_local_batch_hash": self.execution_local_batch_hash,
+            "replay_padding_micro_batches": self.replay_padding_micro_batches,
             "pre_step_state_hash": self.pre_step_state_hash,
             "gradient_hash": gradient_hash,
             "parameters": _parameter_metadata(gradients),

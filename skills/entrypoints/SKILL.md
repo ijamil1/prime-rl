@@ -20,7 +20,7 @@ uv run rl @ examples/reverse_text/rl.toml --dry-run # generate scripts without r
 - **Config:** `RLConfig` (`src/prime_rl/configs/rl.py`)
 - **Entrypoint:** `src/prime_rl/entrypoints/rl.py`
 - **SLURM:** yes — single-node and multi-node
-- **Gradient diagnostic replay:** when `trainer.experimental.gradient_diagnostic.mode = "replay"`, the local RL launcher starts only the trainer process. It skips inference, orchestrator, trainer weight broadcast, and shared W&B mode so the trainer can replay recorded microbatches from `source_dir` without waiting for absent peer processes. Single-run LoRA replay uses a trainer-local synthetic `run_default` at index 0, so optimizer setup does not wait for an orchestrator-written `orch.toml`.
+- **Gradient diagnostic replay:** when `trainer.experimental.gradient_diagnostic.mode = "replay"`, the local RL launcher starts only the trainer process. It skips inference, orchestrator, trainer weight broadcast, and shared W&B mode so the trainer can replay recorded microbatches from `source_dir` without waiting for absent peer processes. Single-run LoRA replay uses a trainer-local synthetic `run_default` at index 0, so optimizer setup does not wait for an orchestrator-written `orch.toml`. Replay pads uneven DP distributions with zero-loss dummy microbatches before strided rank assignment.
 
 ## `sft` — SFT training
 
