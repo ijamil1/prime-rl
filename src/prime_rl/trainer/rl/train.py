@@ -154,6 +154,9 @@ def train(config: TrainerConfig):
         parallel_dims,
         world,
     )
+    if gradient_diagnostic.replay_enabled and config.max_concurrent_runs == 1 and config.model.lora is not None:
+        logger.info("Creating trainer-local run 0 for LoRA gradient diagnostic replay")
+        multi_run_manager.create_trainer_local_run("run_default", idx=0, lora_config=config.model.lora)
 
     # Set up the loss function
     logger.info(f"Setting up loss function ({config.loss})")

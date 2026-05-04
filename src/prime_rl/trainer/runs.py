@@ -312,6 +312,45 @@ class MultiRunManager:
         for hook in self._deletion_hooks:
             hook(deleted_idx, deleted_run)
 
+    def create_trainer_local_run(
+        self,
+        run_id: str,
+        idx: int = 0,
+        lora_config: LoRAConfig | None = None,
+    ) -> None:
+        """Create a trainer-owned run without requiring an orchestrator config.
+
+        Gradient diagnostic replay is trainer-only: no orchestrator writes
+        ``run_default/control/orch.toml``. LoRA still needs a run index so the
+        optimizer can select adapter-specific parameters and the forward pass
+        can use the correct per-run scaling factor.
+        """
+        if idx < 0 or idx >= self.max_runs:
+            raise ValueError(f"Run index {idx} is outside max_runs={self.max_runs}")
+
+        existing_run = self.idx_2_id.get(idx)
+        if existing_run is not None and existing_run != run_id:
+            raise ValueError(f"Run index {idx} is already assigned to {existing_run}")
+
+        existing_idx = self.id_2_idx.get(run_id)
+        if existing_idx is not None and existing_idx != idx:
+            raise ValueError(f"Run {run_id} is already assigned to index {existing_idx}")
+
+        if existing_run is None:
+            self.id_2_idx[run_id] = idx
+            self.idx_2_id[idx] = run_id
+            self.unused_idxs.remove(idx)
+            self.progress[idx] = Progress()
+
+        self.ready_to_update[idx] = False
+        if lora_config is not None:
+            self.scaling_factors[idx] = lora_config.alpha / lora_config.rank
+
+        # This run is created independently on every trainer rank. Mark the
+        # local sync snapshot as current so a later synchronize_state() call
+        # does not try to broadcast a missing orchestrator config for it.
+        self._last_synced_id_2_idx = self.id_2_idx.copy()
+
     # =========================================================================
     # Run Discovery, Synchronization, and Eviction
     # =========================================================================
