@@ -2,6 +2,9 @@ max_steps = 20
 seq_len = 8192
 output_dir = "/workspace/grad_diag_runs/replay_dp"
 
+[model]
+name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+
 [wandb]
 project = "prime-rl-potential-loss-scale-bias"
 name = "replay-dp-main"
