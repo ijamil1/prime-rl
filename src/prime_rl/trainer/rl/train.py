@@ -494,6 +494,30 @@ def train(config: TrainerConfig):
                 micro_step_message += f" | Max Vio: {tensors['max_vio'][-1].mean().item():.4f}"
             logger.debug(micro_step_message)
 
+        if gradient_diagnostic.enabled:
+            trainable_param_messages = []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+
+                local_shape = None
+                if hasattr(param, "to_local"):
+                    local_shape = tuple(param.to_local().shape)
+
+                grad = param.grad
+                grad_shape = tuple(grad.shape) if grad is not None else None
+                grad_local_shape = None
+                if grad is not None and hasattr(grad, "to_local"):
+                    grad_local_shape = tuple(grad.to_local().shape)
+
+                trainable_param_messages.append(
+                    f"{name}: shape={tuple(param.shape)}, local_shape={local_shape}, "
+                    f"type={type(param).__name__}, grad_shape={grad_shape}, grad_local_shape={grad_local_shape}"
+                )
+            logger.debug(
+                "Trainable parameters before gradient diagnostic save "
+                f"(rank={world.rank}, count={len(trainable_param_messages)}):\n" + "\n".join(trainable_param_messages)
+            )
         gradient_diagnostic.save_gradients(progress.step)
         # Optionally, clip the gradients
         grad_norm: torch.Tensor | None = None
