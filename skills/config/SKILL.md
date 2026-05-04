@@ -181,7 +181,7 @@ partition = "round_robin"
 skip_optimizer_step = true
 ```
 
-Replay mode is trainer-only when launched via `uv run rl`: it skips inference and orchestrator startup.
+Replay mode is trainer-only when launched via `uv run rl`: it skips inference and orchestrator startup. For single-run LoRA replay, the trainer creates a local synthetic `run_default` at index 0 so optimizer setup can select adapter-0 parameters without waiting for `run_default/control/orch.toml`.
 
 ## Key files
 
