@@ -986,6 +986,12 @@ class TrainerConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
+    def validate_gradient_replay_single_run(self):
+        if self.experimental.gradient_diagnostic.mode == "replay" and self.max_concurrent_runs > 1:
+            raise ValueError("Gradient diagnostic replay is only supported with max_concurrent_runs = 1")
+        return self
+
+    @model_validator(mode="after")
     def validate_lora_broadcast(self):
         if self.model.lora is not None and self.weight_broadcast.type == "nccl":
             # TODO: Support this
