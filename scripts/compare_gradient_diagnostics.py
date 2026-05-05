@@ -70,6 +70,7 @@ def _compare_step(reference_dir: Path, candidate_dir: Path) -> dict[str, Any]:
         "candidate_loss_scale_min": candidate_metadata.get("dp_loss_scale_min"),
         "candidate_loss_scale_max": candidate_metadata.get("dp_loss_scale_max"),
         "candidate_replay_padding_micro_batches": candidate_metadata.get("replay_padding_micro_batches"),
+        "candidate_replay_padding_tokens": candidate_metadata.get("replay_padding_tokens"),
         "candidate_execution_batch_hash": candidate_metadata.get("execution_batch_hash"),
         "candidate_execution_local_batch_hash": candidate_metadata.get("execution_local_batch_hash"),
     }

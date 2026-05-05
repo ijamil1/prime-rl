@@ -181,7 +181,7 @@ partition = "round_robin"
 skip_optimizer_step = true
 ```
 
-Replay mode is trainer-only when launched via `uv run rl`: it skips inference and orchestrator startup. Replay requires `trainer.max_concurrent_runs = 1`. For single-run LoRA replay, the trainer creates a local synthetic `run_default` at index 0 so optimizer setup can select adapter-0 parameters without waiting for `run_default/control/orch.toml`. When replaying on a larger DP world size than the recording run, replay appends zero-loss dummy microbatches matching `main`'s padding semantics so each DP rank executes the same number of forward/backward collectives.
+Replay mode is trainer-only when launched via `uv run rl`: it skips inference and orchestrator startup. Replay requires `trainer.max_concurrent_runs = 1`. For single-run LoRA replay, the trainer creates a local synthetic `run_default` at index 0 so optimizer setup can select adapter-0 parameters without waiting for `run_default/control/orch.toml`. Replay preserves original artifact hashes, then builds execution batches by padding each tensor microbatch's sequence length to the current CP world size with non-loss-contributing tokens and appending zero-loss dummy microbatches when needed so each DP rank executes the same number of forward/backward collectives.
 
 ## Key files
 

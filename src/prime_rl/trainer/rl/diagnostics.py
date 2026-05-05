@@ -100,6 +100,49 @@ def _make_dummy_tensor_micro_batch(source: TensorMicroBatch) -> TensorMicroBatch
     return dummy
 
 
+def _pad_tensor_sequence(tensor: Tensor, padding_size: int, value: int | float | bool = 0) -> Tensor:
+    padding_shape = (tensor.shape[0], padding_size, *tensor.shape[2:])
+    padding = torch.full(padding_shape, value, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat([tensor, padding], dim=1)
+
+
+def _pad_replay_micro_batch_for_cp(source: TensorMicroBatch, cp_world_size: int) -> TensorMicroBatch:
+    seq_len = source["input_ids"].shape[1]
+    padding_size = -seq_len % cp_world_size
+    if padding_size == 0 or cp_world_size <= 1:
+        return source
+
+    padded = copy.deepcopy(source)
+    padded["input_ids"] = _pad_tensor_sequence(source["input_ids"], padding_size, value=1)
+    padded["advantages"] = _pad_tensor_sequence(source["advantages"], padding_size, value=0.0)
+    padded["loss_mask"] = _pad_tensor_sequence(source["loss_mask"], padding_size, value=False)
+    position_padding = torch.arange(
+        padding_size, dtype=source["position_ids"].dtype, device=source["position_ids"].device
+    ).unsqueeze(0)
+    padded["position_ids"] = torch.cat([source["position_ids"], position_padding], dim=1)
+    padded["inference_logprobs"] = _pad_tensor_sequence(source["inference_logprobs"], padding_size, value=0.0)
+    padded["temperatures"] = _pad_tensor_sequence(source["temperatures"], padding_size, value=1.0)
+    if source["teacher_logprobs"] is not None:
+        padded["teacher_logprobs"] = _pad_tensor_sequence(source["teacher_logprobs"], padding_size, value=0.0)
+    padded["lora_num_tokens"] = source["lora_num_tokens"].clone()
+    padded["lora_num_tokens"][-1] += padding_size
+    if source["mm_token_type_ids"] is not None:
+        padded["mm_token_type_ids"] = _pad_tensor_sequence(source["mm_token_type_ids"], padding_size, value=0)
+    return padded
+
+
+def _pad_replay_micro_batches_for_cp(
+    micro_batches: list[TensorMicroBatch], cp_world_size: int
+) -> list[TensorMicroBatch]:
+    if cp_world_size <= 1:
+        return micro_batches
+
+    padded_micro_batches = [_pad_replay_micro_batch_for_cp(micro_batch, cp_world_size) for micro_batch in micro_batches]
+    if all(padded is original for padded, original in zip(padded_micro_batches, micro_batches, strict=True)):
+        return micro_batches
+    return padded_micro_batches
+
+
 def _pad_replay_micro_batches_for_distribution(
     micro_batches: list[TensorMicroBatch], dp_world_size: int
 ) -> list[TensorMicroBatch]:
@@ -114,13 +157,21 @@ def _pad_replay_micro_batches_for_distribution(
 
 
 class GradientReplayDataLoader:
-    def __init__(self, config: GradientDiagnosticConfig, dp_world_size: int, world: World, start_step: int):
+    def __init__(
+        self,
+        config: GradientDiagnosticConfig,
+        dp_world_size: int,
+        cp_world_size: int,
+        world: World,
+        start_step: int,
+    ):
         if config.source_dir is None:
             raise ValueError("gradient diagnostic replay mode requires source_dir")
         if config.partition != "round_robin":
             raise ValueError(f"Unsupported gradient diagnostic replay partition: {config.partition}")
         self.config = config
         self.dp_world_size = dp_world_size
+        self.cp_world_size = cp_world_size
         self.world = world
         self.non_dp_world_size = world.world_size // dp_world_size
         self.dp_rank = world.rank // self.non_dp_world_size
@@ -131,6 +182,7 @@ class GradientReplayDataLoader:
         self.last_execution_batch_hash: str | None = None
         self.last_execution_local_batch_hash: str | None = None
         self.last_replay_padding_micro_batches = 0
+        self.last_replay_padding_tokens = 0
 
     def wait_for_batch(self) -> None:
         path = _step_dir(self.config.source_dir, self.current_step) / "micro_batches.pt"
@@ -144,10 +196,17 @@ class GradientReplayDataLoader:
         self.last_batch_hash = _hash_value(micro_batches)
         self.last_local_batch_hash = _hash_value(original_local_micro_batches)
 
-        padded_micro_batches = _pad_replay_micro_batches_for_distribution(micro_batches, self.dp_world_size)
-        self.last_replay_padding_micro_batches = len(padded_micro_batches) - original_count
-        self.last_execution_batch_hash = _hash_value(padded_micro_batches)
-        local_micro_batches = padded_micro_batches[self.dp_rank :: self.dp_world_size]
+        cp_padded_micro_batches = _pad_replay_micro_batches_for_cp(micro_batches, self.cp_world_size)
+        self.last_replay_padding_tokens = sum(
+            padded["input_ids"].shape[1] - original["input_ids"].shape[1]
+            for padded, original in zip(cp_padded_micro_batches, micro_batches, strict=True)
+        )
+        execution_micro_batches = _pad_replay_micro_batches_for_distribution(
+            cp_padded_micro_batches, self.dp_world_size
+        )
+        self.last_replay_padding_micro_batches = len(execution_micro_batches) - original_count
+        self.last_execution_batch_hash = _hash_value(execution_micro_batches)
+        local_micro_batches = execution_micro_batches[self.dp_rank :: self.dp_world_size]
         self.last_execution_local_batch_hash = _hash_value(local_micro_batches)
         if not local_micro_batches:
             raise ValueError(
@@ -159,15 +218,22 @@ class GradientReplayDataLoader:
                 "Padded gradient replay microbatches for DP distribution: "
                 f"step={self.current_step}, recorded={original_count}, "
                 f"padding={self.last_replay_padding_micro_batches}, "
-                f"padded={len(padded_micro_batches)}, dp_world_size={self.dp_world_size}, dp_rank={self.dp_rank}"
+                f"padded={len(execution_micro_batches)}, dp_world_size={self.dp_world_size}, dp_rank={self.dp_rank}"
+            )
+        if self.last_replay_padding_tokens:
+            get_logger().debug(
+                "Padded gradient replay microbatch tokens for CP: "
+                f"step={self.current_step}, padding_tokens={self.last_replay_padding_tokens}, "
+                f"cp_world_size={self.cp_world_size}, dp_rank={self.dp_rank}"
             )
         get_logger().debug(
             "Assigned gradient replay microbatches: "
             f"step={self.current_step}, rank={self.world.rank}, dp_rank={self.dp_rank}, "
             f"non_dp_rank={self.non_dp_rank}, world_size={self.world.world_size}, "
             f"dp_world_size={self.dp_world_size}, non_dp_world_size={self.non_dp_world_size}, "
-            f"recorded={original_count}, padded={len(padded_micro_batches)}, "
-            f"padding={self.last_replay_padding_micro_batches}, "
+            f"cp_world_size={self.cp_world_size}, recorded={original_count}, "
+            f"padded={len(execution_micro_batches)}, padding={self.last_replay_padding_micro_batches}, "
+            f"padding_tokens={self.last_replay_padding_tokens}, "
             f"original_local={len(original_local_micro_batches)}, execution_local={len(local_micro_batches)}, "
             f"local_batch_hash={self.last_local_batch_hash}, "
             f"execution_local_batch_hash={self.last_execution_local_batch_hash}"
@@ -284,6 +350,7 @@ class GradientDiagnosticSession:
         self.execution_batch_hash: str | None = None
         self.execution_local_batch_hash: str | None = None
         self.replay_padding_micro_batches = 0
+        self.replay_padding_tokens = 0
         self.pre_step_state_hash: str | None = None
         self.loss_metadata: dict[str, Any] = {}
         self.git_ref = _maybe_get_git_ref()
@@ -316,7 +383,9 @@ class GradientDiagnosticSession:
         return self.config.artifact_dir
 
     def build_replay_dataloader(self, start_step: int) -> GradientReplayDataLoader:
-        return GradientReplayDataLoader(self.config, self.parallel_dims.get_mesh("dp").size(), self.world, start_step)
+        return GradientReplayDataLoader(
+            self.config, self.parallel_dims.get_mesh("dp").size(), self.parallel_dims.cp, self.world, start_step
+        )
 
     def after_batch_loaded(self, step: int, micro_batches: list[TensorMicroBatch], dataloader: Any) -> None:
         if not self.enabled:
@@ -330,6 +399,7 @@ class GradientDiagnosticSession:
             self.execution_batch_hash = getattr(dataloader, "last_execution_batch_hash", None)
             self.execution_local_batch_hash = getattr(dataloader, "last_execution_local_batch_hash", None)
             self.replay_padding_micro_batches = getattr(dataloader, "last_replay_padding_micro_batches", 0)
+            self.replay_padding_tokens = getattr(dataloader, "last_replay_padding_tokens", 0)
 
     def align_pre_step_state(self, step: int) -> None:
         if not self.enabled:
@@ -372,6 +442,7 @@ class GradientDiagnosticSession:
             "execution_batch_hash": self.execution_batch_hash,
             "execution_local_batch_hash": self.execution_local_batch_hash,
             "replay_padding_micro_batches": self.replay_padding_micro_batches,
+            "replay_padding_tokens": self.replay_padding_tokens,
             "pre_step_state_hash": self.pre_step_state_hash,
             "gradient_hash": gradient_hash,
             "parameters": _parameter_metadata(gradients),
