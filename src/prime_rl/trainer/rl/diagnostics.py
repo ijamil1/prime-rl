@@ -124,6 +124,7 @@ class GradientReplayDataLoader:
         self.world = world
         self.non_dp_world_size = world.world_size // dp_world_size
         self.dp_rank = world.rank // self.non_dp_world_size
+        self.non_dp_rank = world.rank % self.non_dp_world_size
         self.current_step = start_step
         self.last_batch_hash: str | None = None
         self.last_local_batch_hash: str | None = None
@@ -160,6 +161,17 @@ class GradientReplayDataLoader:
                 f"padding={self.last_replay_padding_micro_batches}, "
                 f"padded={len(padded_micro_batches)}, dp_world_size={self.dp_world_size}, dp_rank={self.dp_rank}"
             )
+        get_logger().debug(
+            "Assigned gradient replay microbatches: "
+            f"step={self.current_step}, rank={self.world.rank}, dp_rank={self.dp_rank}, "
+            f"non_dp_rank={self.non_dp_rank}, world_size={self.world.world_size}, "
+            f"dp_world_size={self.dp_world_size}, non_dp_world_size={self.non_dp_world_size}, "
+            f"recorded={original_count}, padded={len(padded_micro_batches)}, "
+            f"padding={self.last_replay_padding_micro_batches}, "
+            f"original_local={len(original_local_micro_batches)}, execution_local={len(local_micro_batches)}, "
+            f"local_batch_hash={self.last_local_batch_hash}, "
+            f"execution_local_batch_hash={self.last_execution_local_batch_hash}"
+        )
         self.current_step += 1
         return local_micro_batches
 

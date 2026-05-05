@@ -363,6 +363,24 @@ def train(config: TrainerConfig):
         cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
         cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None
         cp_size = parallel_dims.cp
+        dp_rank = parallel_dims.get_mesh("dp").get_local_rank()
+
+        def log_microstep_boundary(boundary: str, micro_step: int, **kwargs) -> None:
+            fields = {
+                "step": progress.step,
+                "micro_step": micro_step,
+                "rank": world.rank,
+                "dp_rank": dp_rank,
+                "cp_rank": cp_rank,
+                "cp_size": cp_size,
+            }
+            fields.update(kwargs)
+            logger.debug(
+                "Replay microstep boundary "
+                + boundary
+                + ": "
+                + ", ".join(f"{key}={value}" for key, value in fields.items())
+            )
 
         for micro_step, micro_batch in enumerate(micro_batches):
             input_ids = micro_batch["input_ids"].to("cuda")
@@ -400,16 +418,36 @@ def train(config: TrainerConfig):
             )
 
             labels = shift_tensor_left(input_ids)
+            log_microstep_boundary(
+                "loaded",
+                micro_step,
+                input_shape=tuple(input_ids.shape),
+                position_shape=tuple(position_ids.shape),
+                loss_tokens=loss_mask.sum().item(),
+                lora_num_tokens=tuple(micro_batch["lora_num_tokens"].tolist())
+                if config.model.lora and "lora_num_tokens" in micro_batch
+                else None,
+                routed_experts_shape=tuple(routed_experts.shape) if routed_experts is not None else None,
+            )
 
             # VLM + CP is not supported: MRoPE requires global positions but CP shards the sequence
             if cp_enabled and pixel_values is not None:
                 raise NotImplementedError("Context parallelism is not supported with VLM/multimodal training")
 
             if cp_enabled:
+                log_microstep_boundary("before_cp_shard", micro_step)
                 input_ids, forward_position_ids = setup_cp_params(input_ids, position_ids, cp_rank, cp_size, cp_group)
                 labels = shard_for_cp(labels, cp_rank=cp_rank, cp_world_size=cp_size)
                 if routed_experts is not None:
                     routed_experts = shard_for_cp(routed_experts, cp_rank=cp_rank, cp_world_size=cp_size)
+                log_microstep_boundary(
+                    "after_cp_shard",
+                    micro_step,
+                    input_shape=tuple(input_ids.shape),
+                    forward_position_shape=tuple(forward_position_ids.shape),
+                    labels_shape=tuple(labels.shape),
+                    routed_experts_shape=tuple(routed_experts.shape) if routed_experts is not None else None,
+                )
             else:
                 forward_position_ids = position_ids
 
@@ -424,14 +462,31 @@ def train(config: TrainerConfig):
                         adjusted_cu, prepend=torch.tensor([0], device=adjusted_cu.device, dtype=adjusted_cu.dtype)
                     )
                 set_lora_num_tokens(lora_num_tokens)
+                log_microstep_boundary(
+                    "after_lora_tokens",
+                    micro_step,
+                    lora_num_tokens=tuple(lora_num_tokens.detach().cpu().tolist()),
+                    input_numel=input_ids.numel(),
+                )
 
             temperatures = micro_batch["temperatures"].to("cuda")
 
             # Shard temperatures for context parallelism if enabled
             if cp_enabled:
                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
+                log_microstep_boundary(
+                    "after_temperature_shard", micro_step, temperatures_shape=tuple(temperatures.shape)
+                )
 
             # Forward pass with per-token temperatures
+            log_microstep_boundary(
+                "before_forward",
+                micro_step,
+                input_shape=tuple(input_ids.shape),
+                forward_position_shape=tuple(forward_position_ids.shape),
+                labels_shape=tuple(labels.shape),
+                temperatures_shape=tuple(temperatures.shape),
+            )
             with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
                 out = forward(
                     model,
@@ -444,6 +499,13 @@ def train(config: TrainerConfig):
                     mm_token_type_ids=mm_token_type_ids,
                     routed_experts=routed_experts,
                 )
+            log_microstep_boundary(
+                "after_forward",
+                micro_step,
+                logprobs_shape=tuple(out["logprobs"].shape) if out.get("logprobs") is not None else None,
+                logits_shape=tuple(out["logits"].shape) if out.get("logits") is not None else None,
+                entropy_shape=tuple(out["entropy"].shape) if out.get("entropy") is not None else None,
+            )
 
             if out.get("logprobs") is None:
                 # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
@@ -456,8 +518,15 @@ def train(config: TrainerConfig):
             # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
 
             if cp_enabled:
+                log_microstep_boundary("before_cp_gather", micro_step)
                 out["logprobs"] = gather_for_cp(out["logprobs"], cp_group)
                 out["entropy"] = gather_for_cp_wo_grad(out["entropy"], cp_size, cp_group)
+                log_microstep_boundary(
+                    "after_cp_gather",
+                    micro_step,
+                    logprobs_shape=tuple(out["logprobs"].shape),
+                    entropy_shape=tuple(out["entropy"].shape),
+                )
 
             vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
             # This is not really necessary as the first token should be masked out, but we do it anyway to be sure
@@ -470,6 +539,14 @@ def train(config: TrainerConfig):
 
             # Compute loss
             response_lengths = get_response_lengths(position_ids)
+            log_microstep_boundary(
+                "before_loss",
+                micro_step,
+                response_lengths=tuple(response_lengths),
+                logprobs_shape=tuple(out["logprobs"].shape),
+                loss_mask_shape=tuple(loss_mask.shape),
+                loss_tokens=loss_mask.sum().item(),
+            )
             loss, loss_tensors = compute_loss(
                 trainer_logprobs=out["logprobs"].squeeze().split(response_lengths),
                 inference_logprobs=inference_logprobs.squeeze().split(response_lengths),
@@ -481,10 +558,13 @@ def train(config: TrainerConfig):
                 loss_fn=loss_fn,
                 loss_scale=global_token_count,
             )
+            log_microstep_boundary("after_loss", micro_step, loss=loss.detach().item())
 
             # Backward pass
+            log_microstep_boundary("before_backward", micro_step)
             with maybe_record_function("backward"):
                 loss.backward()
+            log_microstep_boundary("after_backward", micro_step)
 
             # compute sum of per-token loss (scaled by 1/global_token_count) across microbatches for each rank
             step_local_loss_sum += loss.detach()
