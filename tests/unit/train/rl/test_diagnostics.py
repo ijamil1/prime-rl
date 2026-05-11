@@ -4,6 +4,8 @@ from prime_rl.trainer.rl.data import TensorMicroBatch
 from prime_rl.trainer.rl.diagnostics import (
     _hash_value,
     _make_dummy_tensor_micro_batch,
+    _pad_replay_micro_batch_for_cp,
+    _pad_replay_micro_batches_for_cp,
     _pad_replay_micro_batches_for_distribution,
 )
 
@@ -70,6 +72,39 @@ def test_replay_padding_leaves_even_batches_unchanged() -> None:
     assert padded is micro_batches
 
 
+def test_replay_cp_padding_matches_main_token_padding_semantics() -> None:
+    source = _micro_batch()
+
+    padded = _pad_replay_micro_batch_for_cp(source, cp_world_size=2)
+
+    assert padded["input_ids"].shape[1] == 4
+    assert padded["input_ids"][0, -1].item() == 1
+    assert padded["advantages"][0, -1].item() == 0.0
+    assert padded["loss_mask"][0, -1].item() is False
+    assert padded["loss_mask"].sum().item() == source["loss_mask"].sum().item()
+    assert padded["position_ids"][0, -1].item() == 0
+    assert padded["inference_logprobs"][0, -1].item() == 0.0
+    assert padded["teacher_logprobs"][0, -1].item() == 0.0
+    assert padded["temperatures"][0, -1].item() == 1.0
+    assert padded["lora_num_tokens"][-1].item() == source["lora_num_tokens"][-1].item() + 1
+
+
+def test_replay_cp_padding_leaves_divisible_batches_unchanged() -> None:
+    source = _micro_batch()
+    source["input_ids"] = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    source["position_ids"] = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+    source["advantages"] = torch.ones(1, 4)
+    source["inference_logprobs"] = torch.zeros(1, 4)
+    source["teacher_logprobs"] = torch.zeros(1, 4)
+    source["loss_mask"] = torch.ones(1, 4, dtype=torch.bool)
+    source["temperatures"] = torch.ones(1, 4)
+    source["lora_num_tokens"] = torch.tensor([4], dtype=torch.int32)
+
+    padded = _pad_replay_micro_batch_for_cp(source, cp_world_size=2)
+
+    assert padded is source
+
+
 def test_replay_padding_keeps_original_hash_separate_from_execution_hash() -> None:
     micro_batches = [_micro_batch(0), _micro_batch(10), _micro_batch(20)]
     original_batch_hash = _hash_value(micro_batches)
@@ -83,3 +118,13 @@ def test_replay_padding_keeps_original_hash_separate_from_execution_hash() -> No
     assert original_rank_1_hash == _hash_value(micro_batches[1::2])
     assert execution_batch_hash != original_batch_hash
     assert execution_rank_1_hash != original_rank_1_hash
+
+
+def test_replay_cp_padding_keeps_original_hash_separate_from_execution_hash() -> None:
+    micro_batches = [_micro_batch(0), _micro_batch(10)]
+    original_batch_hash = _hash_value(micro_batches)
+
+    padded = _pad_replay_micro_batches_for_cp(micro_batches, cp_world_size=2)
+
+    assert original_batch_hash == _hash_value(micro_batches)
+    assert _hash_value(padded) != original_batch_hash
