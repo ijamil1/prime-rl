@@ -1,13 +1,13 @@
 max_steps = 20
 seq_len = 8192
-output_dir = "/workspace/grad_diag_runs/replay_dp_cp"
+output_dir = "/workspace/grad_diag_runs/replay_dp_cp_loss_scale_fix"
 
 [model]
 name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
 [wandb]
 project = "prime-rl-potential-loss-scale-bias"
-name = "replay-dp-cp-existing"
+name = "replay-dp-cp-fix"
 
 [deployment]
 num_train_gpus = 4
@@ -38,7 +38,7 @@ freq = 2
 
 [trainer.experimental.gradient_diagnostic]
 mode = "replay"
-artifact_dir = "/workspace/grad_diag_artifacts/replay_dp_cp"
+artifact_dir = "/workspace/grad_diag_artifacts/replay_dp_cp_loss_scale_fix"
 source_dir = "/workspace/grad_diag_artifacts/reference"
 partition = "round_robin"
 skip_optimizer_step = true
